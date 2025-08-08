@@ -179,7 +179,7 @@ This comprehensive workflow ensures the most robust and reliable inference of hy
 
 Generate a sequence alignment under the null hypothesis of no hybridization.
 
--   **Method**: Use a forward-time sequence evolution simulator, such as the `pyvolve` Python module. You can use a wrapper script like [`phylogenomic_dataset_simulator`](https://github.com/jian-he/phylogenomic_dataset_simulator) to streamline this.
+-   **Method**: Use a forward-time sequence evolution simulator, such as the `pyvolve` Python module. You can use a wrapper script like [`AlignmentSimulator`](https://github.com/Jhe1004/AlignmentSimulator/) to streamline this.
 -   **Inputs**: The rooted ML tree and the substitution model parameters from the Data Preparation step.
 -   **Recommendation**: Simulate a large alignment (e.g., 5 million bp) to ensure even weak false positive signals can be detected.
 -   **Output**: A simulated sequence alignment that has the same evolutionary history as your species tree but is guaranteed to have no gene flow.
