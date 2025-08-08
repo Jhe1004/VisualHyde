@@ -2,30 +2,35 @@
 import os
 import sys
 import argparse
+import csv
 import matplotlib
 from matplotlib import pyplot as plt
-from matplotlib.colors import ListedColormap, Normalize # Added Normalize
-from matplotlib.colorbar import ColorbarBase # Added ColorbarBase
+from matplotlib.colors import ListedColormap, Normalize
+from matplotlib.colorbar import ColorbarBase
 import numpy as np
 import pandas as pd
 from ete3 import Tree, TreeStyle, NodeStyle, faces, random_color, TextFace
-from PIL import Image, ImageEnhance # Added ImageEnhance if needed later, Image is main one
-import warnings # Keep warnings import
-import colorsys # <-- Needed for brightness adjustment
+from PIL import Image, ImageEnhance
+import warnings
+import colorsys
 
-# Set Matplotlib backend and Qt platform variable (if needed)
-# Using 'Agg' is generally good for scripts without a GUI
+# --- Dependencies and Description ---
 matplotlib.use('Agg')
-# This QT variable might not be necessary with 'Agg' but leave it for now
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 
 Description = (
     '''
     -----------------------------------------------------------------------------
-    |                           visual_hyde.py                                  |
+    |                               visual_hyde.py                              |
     -----------------------------------------------------------------------------
 
     Created by Jian He (j.he930724@gamail.com)
+    Modified for enhanced logging and advanced algorithms by the Assistant.
+    The node calculation now uses a 'difference consensus' algorithm.
+    The script now filters results based on P-value instead of Z-score.
+    Added an optional false positive filter based on null-hypothesis simulations,
+    with distinct logic for leaf and node modes.
+    Added robust error checking for all input file name consistencies.
 
     Dependencies:
     python3
@@ -33,33 +38,66 @@ Description = (
     matplotlib (conda install matplotlib)
     numpy (conda install numpy)
     pandas (conda install pandas)
-    Pillow (conda install Pillow or pip install Pillow) # PIL is part of Pillow
+    Pillow (conda install Pillow or pip install Pillow)
     colorsys (standard library)
-
+    csv (standard library)
     '''
 )
 
-# --- Helper Functions ---
+# --- Utility Functions ---
+def get_safe_leaf_name(leaf_name):
+    """Converts a leaf name into a filesystem-safe string."""
+    return "".join(c if c.isalnum() else "_" for c in str(leaf_name))
 
+def apply_relative_filter(real_heatmap, null_heatmap, threshold):
+    """
+    Applies the relative strength filter to a heatmap DataFrame.
+    Returns the filtered DataFrame.
+    """
+    if null_heatmap is None:
+        return real_heatmap
+    
+    filtered_heatmap = real_heatmap.copy()
+    filtered_count = 0
+    for p1 in filtered_heatmap.index:
+        for p2 in filtered_heatmap.columns:
+            gamma_real = filtered_heatmap.loc[p1, p2]
+            if pd.notna(gamma_real):
+                try:
+                    gamma_null = null_heatmap.loc[p1, p2]
+                    if pd.notna(gamma_null):
+                        s_gamma_real = min(gamma_real, 1 - gamma_real)
+                        s_gamma_null = min(gamma_null, 1 - gamma_null)
+
+                        if s_gamma_real > 1e-9:
+                            ratio = s_gamma_null / s_gamma_real
+                            if ratio >= threshold:
+                                filtered_heatmap.loc[p1, p2] = np.nan
+                                filtered_count += 1
+                        elif s_gamma_null > 1e-9:
+                            filtered_heatmap.loc[p1, p2] = np.nan
+                            filtered_count += 1
+                except KeyError:
+                    continue
+    if filtered_count > 0:
+        print(f"    ...filtered out {filtered_count} potential false positive signals.")
+    return filtered_heatmap
+
+
+# --- Data Parsing and Preparation Functions ---
 def make_predefined_clade_file(tree_file, max_leaves_per_clade=5):
     """
     Automatically generates a simple predefined clade file based on the input tree.
-    Each automatically defined clade contains no more than max_leaves_per_clade leaf nodes.
-
-    Args:
-        tree_file (str): Path to the species tree file.
-        max_leaves_per_clade (int): Maximum number of leaf nodes per automatically defined clade.
     """
     try:
         t = Tree(tree_file)
-        # Find ingroup node (assuming outgroup is a single leaf or smaller subtree)
         if len(t.children) != 2:
             print("Warning: Tree does not appear to be bifurcating or root position is unclear, automatic clade definition might be inaccurate.")
             if len(t.children) > 0:
                 ingroup_node = max(t.children, key=len)
                 print(f"Warning: Attempting to use subtree with {len(ingroup_node)} leaf nodes as ingroup for automatic clades.")
             else:
-                ingroup_node = t # If no children, use the whole tree
+                ingroup_node = t
         elif len(t.children[0]) > len(t.children[1]):
             ingroup_node = t.children[0]
         else:
@@ -93,14 +131,6 @@ def make_predefined_clade_file(tree_file, max_leaves_per_clade=5):
 def parse_tree(tree_file, predefined_clade_file):
     """
     Parses the species tree file and the predefined clade file.
-
-    Args:
-        tree_file (str): Path to the species tree file (Newick format).
-        predefined_clade_file (str): Path to the predefined clade file.
-
-    Returns:
-        tuple: Containing the ETE3 Tree object, list of leaf node names (in tree order),
-               list of highlight clades, and the range of name lengths. Returns None on error.
     """
     try:
         t = Tree(tree_file)
@@ -133,18 +163,15 @@ def parse_tree(tree_file, predefined_clade_file):
                             first_leaf_index = leaf_labels.index(line_list[0])
                             subtrees.append(line_list + [first_leaf_index])
                         except ValueError:
-                             print(f"Warning: Name '{line_list[0]}' in predefined clade not found in leaf labels, skipping.")
+                            print(f"Warning: Name '{line_list[0]}' in predefined clade not found in leaf labels, skipping.")
         except FileNotFoundError:
             print(f"Error: Predefined clade file not found: {predefined_clade_file}")
             return None
 
         subtrees.sort(key=lambda elem: elem[-1])
         highlight_subtrees = [elem[:-1] for elem in subtrees]
-
         name_len_list = [len(str(name)) for name in leaf_labels]
-        name_len = (min(name_len_list) if name_len_list else 0,
-                    max(name_len_list) if name_len_list else 0)
-
+        name_len = (min(name_len_list) if name_len_list else 0, max(name_len_list) if name_len_list else 0)
         return t, leaf_labels, highlight_subtrees, name_len
     except FileNotFoundError:
         print(f"Error: Tree file not found - {tree_file}")
@@ -153,18 +180,22 @@ def parse_tree(tree_file, predefined_clade_file):
         print(f"Error: Error parsing tree or clade file: {e}")
         return None
 
-def make_hotmap_table_gamma(leaf_labels, hypothesis_hybrid_species, hyde_data_df, zscore):
-    """Generates the heatmap data table (DataFrame) for the specified hybrid."""
+def make_hotmap_table_gamma(leaf_labels, hypothesis_hybrid_species, hyde_data_df, pvalue_threshold, 
+                            null_heatmap_data=None, filter_ratio_threshold=0.05):
+    """
+    Generates the heatmap data table (DataFrame) for the specified hybrid.
+    Optionally filters the results based on a null-hypothesis dataset.
+    """
     hypothesis_hybrid_species_str = str(hypothesis_hybrid_species)
     leaf_labels_str = [str(lbl) for lbl in leaf_labels]
     hyde_data_df_copy = hyde_data_df.copy()
     for col in ['Hybrid', 'P1', 'P2']:
-         if col in hyde_data_df_copy.columns:
-             hyde_data_df_copy[col] = hyde_data_df_copy[col].astype(str)
+        if col in hyde_data_df_copy.columns:
+            hyde_data_df_copy[col] = hyde_data_df_copy[col].astype(str)
 
     sub_table = hyde_data_df_copy[
         (hyde_data_df_copy["Hybrid"] == hypothesis_hybrid_species_str) &
-        (hyde_data_df_copy["Zscore"].astype(float) > zscore)
+        (hyde_data_df_copy["Pvalue"].astype(float) < pvalue_threshold)
     ]
 
     def get_gamma(hyde_out_table, each_index, each_column):
@@ -189,225 +220,314 @@ def make_hotmap_table_gamma(leaf_labels, hypothesis_hybrid_species, hyde_data_df
             if pd.notna(gamma):
                 if 0 <= gamma <= 1: df.at[each_index, each_column] = gamma
                 else: pass
+
+    if null_heatmap_data:
+        safe_leaf_name_key = get_safe_leaf_name(hypothesis_hybrid_species_str)
+        null_heatmap = null_heatmap_data.get(safe_leaf_name_key)
+        if null_heatmap is not None:
+            print(f"  Applying null hypothesis filter for leaf: {hypothesis_hybrid_species_str}...")
+            df = apply_relative_filter(df, null_heatmap, filter_ratio_threshold)
+
     return df
 
-def calculate_all_node_heatmaps(tree, leaf_labels, hyde_data_df, zscore_threshold, gamma_diff_threshold=0.2):
-    """Calculates and caches the heatmap for each node using postorder traversal (v1.8 logic)."""
-    node_heatmap_cache = {}
+def calculate_all_node_heatmaps(tree, leaf_labels, hyde_data_df, pvalue_threshold, 
+                                gamma_diff_threshold=0.2, 
+                                diff_consensus_threshold=0.05,
+                                diff_consensus_ratio=0.5):
+    """
+    Calculates node heatmaps using the two-pass 'difference consensus' algorithm.
+    NOTE: This function intentionally does NOT apply the null-hypothesis filter during its
+    internal calculations to ensure the consensus algorithm works on unfiltered data.
+    Filtering should be applied as a post-processing step in the main loop.
+    """
     leaf_labels_str = [str(lbl) for lbl in leaf_labels]
     all_leaf_labels_set_str = set(leaf_labels_str)
+    
+    # --- STAGE 1: Postorder traversal to generate DRAFT and DIFFERENCE heatmaps ---
+    print(f"Stage 1 (Postorder): Generating draft values and difference maps with loose threshold ({gamma_diff_threshold})...")
+    draft_heatmaps = {}
+    diff_heatmaps = {}
+    
+    all_nodes_postorder = list(tree.traverse("postorder"))
+    total_nodes = len(all_nodes_postorder)
+    processed_count = 0
 
-    print(f"Starting calculation of all node heatmaps (postorder traversal, gamma diff threshold={gamma_diff_threshold})...")
-    processed_node_count = 0
-    total_nodes = len(list(tree.traverse()))
-
-    for node in tree.traverse("postorder"):
-        processed_node_count += 1
-        if processed_node_count % 10 == 0 or processed_node_count == total_nodes:
-            node_id_str = str(node.name) if hasattr(node, 'name') and node.name else f"InternalNode_{processed_node_count}"
-            if node.is_leaf(): node_id_str = str(node.name)
-            print(f"  Processing node {processed_node_count}/{total_nodes} ({node_id_str})...")
-
-        node_descendants_str = set(str(n) for n in node.get_leaf_names())
+    for node in all_nodes_postorder:
+        processed_count += 1
+        if processed_count % 20 == 0 or processed_count == total_nodes:
+            percentage = (processed_count / total_nodes) * 100
+            print(f"  ...processed {processed_count}/{total_nodes} nodes ({percentage:.1f}%)")
 
         if node.is_leaf():
             node_name_str = str(node.name)
             if node_name_str in all_leaf_labels_set_str:
-                leaf_heatmap = make_hotmap_table_gamma(leaf_labels_str, node_name_str, hyde_data_df, zscore_threshold)
-                node_heatmap_cache[node] = leaf_heatmap
+                # *** MODIFIED: Node mode calculation IGNORES leaf-level filters ***
+                draft_heatmaps[node] = make_hotmap_table_gamma(leaf_labels_str, node_name_str, hyde_data_df, pvalue_threshold)
             else:
-                nan_heatmap = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
-                node_heatmap_cache[node] = nan_heatmap
-        else:
+                draft_heatmaps[node] = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
+        else: # Internal node
             children = node.children
             if len(children) == 2:
                 child1, child2 = children
-                child1_heatmap = node_heatmap_cache.get(child1)
-                child2_heatmap = node_heatmap_cache.get(child2)
+                child1_heatmap = draft_heatmaps.get(child1)
+                child2_heatmap = draft_heatmaps.get(child2)
 
-                if child1_heatmap is None or child2_heatmap is None:
-                    node_name_str = str(node.name) if hasattr(node,'name') and node.name else 'Unnamed'
-                    print(f"Warning: Child heatmap not found for internal node {node_name_str}, skipping.")
-                    nan_heatmap = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
-                    node_heatmap_cache[node] = nan_heatmap
-                    continue
+                current_draft_heatmap = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
+                current_diff_heatmap = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
 
-                current_node_heatmap = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
-                for p1_name in leaf_labels_str:
-                    if p1_name in node_descendants_str: continue
-                    for p2_name in leaf_labels_str:
-                        if p2_name in node_descendants_str or p1_name == p2_name: continue
-                        try:
-                            gamma1 = child1_heatmap.loc[p1_name, p2_name]
-                            gamma2 = child2_heatmap.loc[p1_name, p2_name]
-                        except KeyError: gamma1, gamma2 = np.nan, np.nan
-
-                        avg_gamma = np.nan
-                        try:
-                            if pd.notna(gamma1) and pd.notna(gamma2):
-                                if abs(gamma1 - gamma2) < gamma_diff_threshold:
-                                    avg_gamma = (gamma1 + gamma2) / 2.0
-                        except TypeError: avg_gamma = np.nan
-
-                        if pd.notna(avg_gamma):
-                            current_node_heatmap.loc[p1_name, p2_name] = avg_gamma
-
-                node_heatmap_cache[node] = current_node_heatmap
+                if child1_heatmap is not None and child2_heatmap is not None:
+                    node_descendants_str = set(str(n) for n in node.get_leaf_names())
+                    for p1_name in leaf_labels_str:
+                        if p1_name in node_descendants_str: continue
+                        for p2_name in leaf_labels_str:
+                            if p2_name in node_descendants_str or p1_name == p2_name: continue
+                            try:
+                                gamma1 = child1_heatmap.loc[p1_name, p2_name]
+                                gamma2 = child2_heatmap.loc[p1_name, p2_name]
+                                if pd.notna(gamma1) and pd.notna(gamma2):
+                                    diff = abs(gamma1 - gamma2)
+                                    current_diff_heatmap.loc[p1_name, p2_name] = diff
+                                    if diff < gamma_diff_threshold:
+                                        avg_gamma = (gamma1 + gamma2) / 2.0
+                                        current_draft_heatmap.loc[p1_name, p2_name] = avg_gamma
+                            except (KeyError, TypeError):
+                                continue
+                
+                draft_heatmaps[node] = current_draft_heatmap
+                diff_heatmaps[node] = current_diff_heatmap
             else:
-                node_name_str = str(node.name) if hasattr(node,'name') and node.name else 'Unnamed'
-                print(f"Warning: Internal node {node_name_str} is not binary ({len(children)} children), skipping.")
-                nan_heatmap = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
-                node_heatmap_cache[node] = nan_heatmap
+                draft_heatmaps[node] = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
+                diff_heatmaps[node] = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
+    
+    print("Stage 1 completed. Draft and difference maps generated for all nodes.")
 
-    print("All node heatmap calculations completed.")
-    return node_heatmap_cache
+    # --- STAGE 2: Preorder traversal for FINAL heatmaps using 'difference consensus' ---
+    final_heatmaps = {}
+    final_logs = {}
 
-# --- Plotting Functions ---
-# --- Draw heatmap WITHOUT colorbar (Dynamic Size) ---
-def draw_hotmap(pic_name, hyde_output_array):
+    print(f"\nStage 2 (Preorder, 'difference consensus'): Refining with diff threshold={diff_consensus_threshold}, ratio={diff_consensus_ratio}...")
+
+    for node in tree.traverse("preorder"):
+        if node.is_leaf():
+            final_heatmaps[node] = draft_heatmaps.get(node)
+            continue
+
+        final_heatmap_for_node = pd.DataFrame(np.nan, index=leaf_labels_str, columns=leaf_labels_str, dtype=float)
+        current_node_log_data = [] 
+        
+        subtree_nodes = [n for n in node.traverse() if not n.is_leaf()]
+        node_descendants_str = set(str(n) for n in node.get_leaf_names())
+
+        for p1_name in leaf_labels_str:
+            if p1_name in node_descendants_str: continue
+            for p2_name in leaf_labels_str:
+                if p2_name in node_descendants_str or p1_name == p2_name: continue
+                
+                diff_values_in_subtree = [
+                    diff_heatmaps.get(sub_node).loc[p1_name, p2_name]
+                    for sub_node in subtree_nodes
+                    if sub_node in diff_heatmaps and pd.notna(diff_heatmaps.get(sub_node).loc[p1_name, p2_name])
+                ]
+                
+                total_internal_nodes = len(diff_values_in_subtree)
+                if total_internal_nodes == 0: continue
+
+                low_diff_count = sum(1 for diff in diff_values_in_subtree if diff < diff_consensus_threshold)
+                ratio_found = low_diff_count / total_internal_nodes if total_internal_nodes > 0 else 0
+                
+                result = 'FAIL'
+                final_gamma_val = 'N/A'
+
+                if ratio_found > diff_consensus_ratio:
+                    result = 'PASS'
+                    final_gamma = draft_heatmaps.get(node).loc[p1_name, p2_name]
+                    if pd.notna(final_gamma):
+                        final_heatmap_for_node.loc[p1_name, p2_name] = final_gamma
+                        final_gamma_val = f"{final_gamma:.4f}"
+
+                diff_values_str = ";".join(f"{d:.4f}" for d in diff_values_in_subtree)
+
+                log_row = [
+                    p1_name, p2_name,
+                    f"{diff_consensus_ratio:.2f}", f"{ratio_found:.2f}",
+                    low_diff_count, total_internal_nodes,
+                    f"< {diff_consensus_threshold}",
+                    final_gamma_val, result, diff_values_str
+                ]
+                current_node_log_data.append(log_row)
+
+        final_heatmaps[node] = final_heatmap_for_node
+        final_logs[node] = current_node_log_data
+
+    print("Stage 2 completed. All node heatmaps have been finalized.")
+    return final_heatmaps, final_logs
+
+def check_name_consistency(tree, hyde_df):
     """
-    Draws the heatmap WITHOUT the colorbar, using a dynamic size based on
-    the number of leaves and the original saturation.
-    Returns the path to the saved heatmap image, the ORIGINAL colormap,
-    and the normalization object.
+    Strictly checks if all names in the HyDe file are present in the tree.
+    Exits with an error if any mismatch is found.
     """
-    # Save data to CSV
+    leaves_name_in_species_tree = set()
     try:
-        hyde_output_array.to_csv(pic_name + ".csv", index=True, sep=',')
+        if len(tree.children) == 2 and len(tree.children[0]) != len(tree.children[1]):
+            ingroup_node = max(tree.children, key=len)
+        else: ingroup_node = tree
+        leaves_name_in_species_tree = set(str(leaf.name) for leaf in ingroup_node.get_leaves() if leaf.name is not None)
     except Exception as e:
-        print(f"Warning: Could not save heatmap data to CSV '{pic_name}.csv': {e}")
+        print(f"FATAL ERROR: Could not extract leaf names from tree: {e}"); sys.exit(1)
+    
+    if not leaves_name_in_species_tree:
+        print("FATAL ERROR: Could not extract any valid leaf node names from the provided tree file."); sys.exit(1)
+    
+    hyde_names = set()
+    try:
+        for col in ['P1', 'Hybrid', 'P2']:
+            if col in hyde_df.columns:
+                valid_names = {str(name) for name in hyde_df[col].dropna().unique() if name}
+                hyde_names.update(valid_names)
+    except Exception as e: 
+        print(f"FATAL ERROR: Could not extract names from HyDe data file: {e}"); sys.exit(1)
 
-    # --- Calculate dynamic figure size ---
-    num_leaves = hyde_output_array.shape[0] # Get number of rows (leaves)
+    if not hyde_names: 
+        print("FATAL ERROR: No valid names (P1/Hybrid/P2) could be extracted from the HyDe file."); sys.exit(1)
+
+    missing_in_tree = hyde_names - leaves_name_in_species_tree
+    if not missing_in_tree:
+        print("Name consistency check passed: All HyDe participants found in tree leaves.")
+        missing_in_hyde = leaves_name_in_species_tree - hyde_names
+        if missing_in_hyde: 
+            print(f"  (Note: These tree leaves are not participants in any HyDe triplet: {', '.join(missing_in_hyde)})")
+        return True
+    else:
+        print("\nFATAL ERROR: Name mismatch detected. The script cannot continue.")
+        print(f"The following names were found in your HyDe input file but are MISSING from your species tree:")
+        for name in sorted(list(missing_in_tree)):
+            print(f"  - {name}")
+        print("Please correct the names in your input files to ensure they match perfectly.")
+        sys.exit(1)
+
+# --- NEW CONSOLIDATED PLOTTING FUNCTION ---
+def generate_hyde_visualization(fig_prefix, hyde_output_array, tree_file, node_num, highlight_target, clade_definitions, name_len, colorbar_brightness_factor):
+    """
+    Consolidates the logic of drawing the heatmap, tree, colorbar, and combining them into a single figure.
+    This function creates and deletes temporary files as part of its execution.
+    Returns True on success, False on failure.
+    """
+    temp_hotmap_file = None
+    temp_colorbar_file = None
+    temp_tree_file = None
+
+    # --- Part 1: Draw Hotmap (from draw_hotmap) ---
+    try:
+        hyde_output_array.to_csv(fig_prefix + ".csv", index=True, sep=',')
+    except Exception as e:
+        print(f"Warning: Could not save heatmap data to CSV '{fig_prefix}.csv': {e}")
+    
+    num_leaves = hyde_output_array.shape[0]
     if num_leaves == 0:
         print("Warning: Heatmap data is empty, cannot draw heatmap.")
-        return None, None, None
+        return False
 
-    # --- Parameters for dynamic sizing (ADJUST THESE AS NEEDED) ---
-    inches_per_leaf = 0.4  # How many inches per leaf in the heatmap
-    base_inches = 2.0      # A minimum base size in inches
-    max_inches = 30.0      # Maximum size in inches (original value)
-    # --- End Parameters ---
-
-    # Calculate the figure size, ensuring it doesn't exceed max_inches
+    inches_per_leaf = 0.4
+    base_inches = 2.0
+    max_inches = 30.0
     fig_inches = min(max_inches, base_inches + num_leaves * inches_per_leaf)
-    print(f"Calculated heatmap figsize: {fig_inches:.2f} x {fig_inches:.2f} inches for {num_leaves} leaves.")
-
-    # Create figure and axes with dynamic size
-    fig = plt.figure(figsize=(fig_inches, fig_inches)) # <-- USE DYNAMIC SIZE
-    border_width = 0.00001 # Keep border calculation relative
-    ax_size = [0 + border_width, 0 + border_width,
-               1 - 2 * border_width, 1 - 2 * border_width]
-    ax = fig.add_axes(ax_size)
-
-    # --- Create ORIGINAL colormap (original logic) ---
-    # (Colormap creation logic remains the same)
+    
+    fig_hotmap = plt.figure(figsize=(fig_inches, fig_inches))
+    border_width = 0.00001
+    ax_size = [0 + border_width, 0 + border_width, 1 - 2 * border_width, 1 - 2 * border_width]
+    ax = fig_hotmap.add_axes(ax_size)
+    
     cmap_list = []
-    color_val = 1.0
-    lucency = 0.0
-    steps = 5000 # Keep high resolution for smoothness
+    color_val = 1.0; lucency = 0.0; steps = 5000
     for _ in range(steps):
-        cmap_list.append([0, 0, color_val, lucency]) # Blue to transparent
-        color_val -= (1.0 / steps)
-        lucency += (1.0 / steps)
-
-    color_val = 0.0
-    lucency = 1.0
+        cmap_list.append([0, 0, color_val, lucency])
+        color_val -= (1.0 / steps); lucency += (1.0 / steps)
+    color_val = 0.0; lucency = 1.0
     for _ in range(steps):
-        cmap_list.append([color_val, 0, 0, lucency]) # Transparent to red
-        color_val += (1.0 / steps)
-        lucency -= (1.0 / steps)
-
+        cmap_list.append([color_val, 0, 0, lucency])
+        color_val += (1.0 / steps); lucency -= (1.0 / steps)
+    
     cmap_array = np.clip(np.array(cmap_list), 0, 1)
     original_cmap = ListedColormap(cmap_array)
-    original_cmap.set_bad(color='white', alpha=0) # Set NaN color
-
-    # Create normalization object
+    original_cmap.set_bad(color='white', alpha=0)
     norm = Normalize(vmin=0, vmax=1)
-
-    # Draw the image using the ORIGINAL colormap
-    im = ax.imshow(hyde_output_array.astype(float),
-                   norm=norm,
-                   cmap=original_cmap,
-                   interpolation='nearest', # 'nearest' is good for discrete blocks
-                   aspect='equal')
-
-    # Add grid lines - Adjust linewidth based on figure size? Optional.
-    grid_linewidth = max(0.5, min(2, fig_inches / 10.0)) # Optional scaling
+    
+    ax.imshow(hyde_output_array.astype(float), norm=norm, cmap=original_cmap, interpolation='nearest', aspect='equal')
+    grid_linewidth = max(0.5, min(2, fig_inches / 10.0))
     ax.set_xticks(np.arange(hyde_output_array.shape[1] + 1) - .5, minor=True)
     ax.set_yticks(np.arange(hyde_output_array.shape[0] + 1) - .5, minor=True)
-    ax.grid(which="minor", color="black", linestyle='-', linewidth=grid_linewidth) # Use scaled linewidth
-
-    # Hide axis labels and ticks
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_xticklabels([])
-    ax.set_yticklabels([])
-
-    # Save heatmap to temporary file
-    temp_hotmap_file = pic_name + "_hotmap_temp.png"
+    ax.grid(which="minor", color="black", linestyle='-', linewidth=grid_linewidth)
+    ax.set_xticks([]); ax.set_yticks([]); ax.set_xticklabels([]); ax.set_yticklabels([])
+    
+    temp_hotmap_file = fig_prefix + "_hotmap_temp.png"
     try:
-        # Keep DPI consistent, pixel size will now vary with fig_inches
         plt.savefig(temp_hotmap_file, dpi=200)
-        print(f"Saved temporary heatmap: {temp_hotmap_file} ({(fig_inches*200):.0f}x{(fig_inches*200):.0f} px)")
     except Exception as e:
         print(f"Error: Error saving heatmap: {e}")
-        temp_hotmap_file = None
+        plt.cla(); plt.clf(); plt.close(fig_hotmap); plt.close("all")
+        return False
     finally:
-        # Ensure matplotlib resources are released
-        plt.cla()
-        plt.clf()
-        plt.close(fig)
-        plt.close("all") # Close any other potential figures
+        plt.cla(); plt.clf(); plt.close(fig_hotmap); plt.close("all")
 
-    # Return temporary filename, the ORIGINAL colormap, and normalization object
-    return temp_hotmap_file, original_cmap, norm
+    # --- Part 2: Draw Colorbar ---
+    darker_colors_rgba = []
+    cmap_for_colorbar = None
+    if original_cmap:
+        heatmap_colors_rgba = original_cmap.colors
+        for r, g, b, a in heatmap_colors_rgba:
+            try:
+                h, s, v = colorsys.rgb_to_hsv(r, g, b)
+                v_new = max(0.0, min(1.0, v * colorbar_brightness_factor))
+                new_r, new_g, new_b = colorsys.hsv_to_rgb(h, s, v_new)
+                darker_colors_rgba.append([new_r, new_g, new_b, a])
+            except Exception as e:
+                darker_colors_rgba.append([r, g, b, a])
+        cmap_for_colorbar = ListedColormap(darker_colors_rgba)
+        cmap_for_colorbar.set_bad(color='white', alpha=0)
 
-# --- Draw only the colorbar ---
-def draw_colorbar_only(colorbar_pic_name, cmap, norm):
-    """Draws only the colorbar to a separate image file."""
-    fig = plt.figure(figsize=(2, 10)) # Tall and narrow
-    ax = fig.add_axes([0.2, 0.05, 0.2, 0.9]) # Position for the bar
-    try:
-        cb = ColorbarBase(ax, cmap=cmap, norm=norm, orientation='vertical')
-        cb.ax.tick_params(labelsize=40) # Label size
-        plt.savefig(colorbar_pic_name, dpi=200, bbox_inches='tight', pad_inches=0.1)
-        return colorbar_pic_name
-    except Exception as e:
-        print(f"Error: Error saving colorbar image '{colorbar_pic_name}': {e}")
-        return None
-    finally:
-        plt.cla()
-        plt.clf()
-        plt.close(fig)
-        plt.close("all")
+    if cmap_for_colorbar and norm:
+        fig_cbar = plt.figure(figsize=(2, 10))
+        ax_cbar = fig_cbar.add_axes([0.2, 0.05, 0.2, 0.9])
+        temp_colorbar_file = f"{fig_prefix}_colorbar_temp.png"
+        try:
+            cb = ColorbarBase(ax_cbar, cmap=cmap_for_colorbar, norm=norm, orientation='vertical')
+            cb.ax.tick_params(labelsize=40)
+            plt.savefig(temp_colorbar_file, dpi=200, bbox_inches='tight', pad_inches=0.1)
+        except Exception as e:
+            print(f"Error: Error saving colorbar image '{temp_colorbar_file}': {e}")
+            plt.cla(); plt.clf(); plt.close(fig_cbar); plt.close("all")
+            if os.path.exists(temp_hotmap_file): os.remove(temp_hotmap_file)
+            return False
+        finally:
+            plt.cla(); plt.clf(); plt.close(fig_cbar); plt.close("all")
+    else:
+        if os.path.exists(temp_hotmap_file): os.remove(temp_hotmap_file)
+        return False
 
-# --- Draw tree (Increased Height Factor) ---
-def draw_tree(tree_file, node_num, highlight_target, clade_definitions, name_len, picture_size): # picture_size unused currently
-    """Draws the tree (original logic + increased height factor)."""
+    # --- Part 3: Draw Tree ---
     try:
         t = Tree(tree_file)
     except Exception as e:
         print(f"Error: Could not reload tree file {tree_file} in draw_tree: {e}")
-        return None
-
+        if os.path.exists(temp_hotmap_file): os.remove(temp_hotmap_file)
+        if os.path.exists(temp_colorbar_file): os.remove(temp_colorbar_file)
+        return False
+    
     def node_layout_background(node):
         ns = NodeStyle(); ns["hz_line_width"]=4.5; ns["vt_line_width"]=4.5; ns["size"]=0; node.set_style(ns)
-
     def node_layout(node, color):
         if node.is_leaf():
             node_name_str = str(node.name) if node.name is not None else ""
             padding_dots = "·" * ((name_len[1] - len(node_name_str)) * 2 + 10)
             leaf_name_text = node_name_str + padding_dots
-            # Consider reducing fsize if height is still an issue
             descFace = faces.TextFace(leaf_name_text, fsize=30, fgcolor=color if color else 'black')
             descFace.margin_top = 3; descFace.margin_bottom = 3; descFace.border.margin = 1
             node.add_face(descFace, column=1, position='aligned')
         ns = NodeStyle(); ns["hz_line_width"]=4.5; ns["vt_line_width"]=4.5
         ns["vt_line_color"]=color; ns["hz_line_color"]=color; ns["size"]=0; node.set_style(ns)
-
+    
     all_clade_leaves = set(str(name) for clade in clade_definitions for name in clade if name)
-
     for each_node in t.traverse():
         node_name_str = str(each_node.name) if each_node.name is not None else ""
         if each_node.is_leaf():
@@ -417,7 +537,7 @@ def draw_tree(tree_file, node_num, highlight_target, clade_definitions, name_len
                 each_node.add_face(node_face, column=0, position="branch-right")
             if node_name_str not in all_clade_leaves: pass
         else: node_layout_background(each_node)
-
+    
     h = 0
     for each_subtree in clade_definitions:
         color = random_color(h, s=0.9, l=0.4); h = h + 0.58
@@ -433,11 +553,10 @@ def draw_tree(tree_file, node_num, highlight_target, clade_definitions, name_len
                     Highlight_node = t.get_common_ancestor(nodes_in_subtree)
                     for node in Highlight_node.traverse():
                         if node.is_leaf():
-                           if str(node.name) in subtree_str: node_layout(node, color)
+                            if str(node.name) in subtree_str: node_layout(node, color)
                         else: node_layout(node, color)
-            else: pass
         except Exception as e: print(f"Warning: Error processing predefined clade {each_subtree}: {e}")
-
+    
     if node_num and isinstance(highlight_target, list) and highlight_target:
         try:
             target_leaves_str = {str(name) for name in highlight_target}
@@ -448,502 +567,312 @@ def draw_tree(tree_file, node_num, highlight_target, clade_definitions, name_len
                     node_face = TextFace(str(node_num), fsize=40); node_face.background.color = "LightGreen"
                     target_ancestor.add_face(node_face, column=0, position="branch-right")
         except Exception as e: print(f"Warning: Could not label node {node_num}: {e}")
-
+    
     ts = TreeStyle(); ts.scale = 40; ts.draw_guiding_lines = True
     ts.show_leaf_name = False; ts.force_topology = True; ts.show_scale = False
-
     temp_tree_file = "tree_temp.png"
     try:
-        num_leaves = len(t.get_leaves())
-        # *** INCREASED HEIGHT MULTIPLIER (adjust 60 if needed) ***
-        render_height = max(100, num_leaves * 20)
-        print(f"Rendering tree with estimated height: {render_height}")
+        num_leaves_tree = len(t.get_leaves())
+        render_height = max(100, num_leaves_tree * 20)
         t.render(temp_tree_file, h=render_height, tree_style=ts, dpi=200)
-        return temp_tree_file
     except Exception as e:
         print(f"Error: Error rendering tree: {e}")
-        return None
+        if os.path.exists(temp_hotmap_file): os.remove(temp_hotmap_file)
+        if os.path.exists(temp_colorbar_file): os.remove(temp_colorbar_file)
+        return False
 
-# --- Combine Figure (Rotated Tree Below Heatmap, Backward Compatible Resize) ---
-def combine_fig(fig_name, tree_img_path, hotmap_img_path, colorbar_img_path):
-    """
-    Combines the species tree image (left), the heatmap image (top-middle),
-    a rotated tree (bottom-middle), and the separate colorbar image (right).
-    Uses older Pillow resize syntax for backward compatibility (Pillow < 9.0).
-    """
+    # --- Part 4: Combine Figures ---
     try:
-        treepic_orig = Image.open(tree_img_path)
-        hotpic_orig = Image.open(hotmap_img_path)
-        colorbarpic_orig = Image.open(colorbar_img_path)
-    except FileNotFoundError as e:
-        print(f"Error: Cannot find temporary image file for combining: {e}. Cannot combine images.")
-        return
-    except Exception as e:
-        print(f"Error: Error opening temporary images: {e}")
-        return
-
+        treepic_orig = Image.open(temp_tree_file)
+        hotpic_orig = Image.open(temp_hotmap_file)
+        colorbarpic_orig = Image.open(temp_colorbar_file)
+    except (FileNotFoundError, Exception) as e:
+        print(f"Error: Cannot find/open temporary image file for combining: {e}.")
+        return False
+    
     try:
-        # --- Rotate tree ---
         treepic_rotate_orig = treepic_orig.rotate(90, expand=True)
-
-        # --- Get original dimensions ---
         tree_w_orig, tree_h_orig = treepic_orig.size
         hot_w_orig, hot_h_orig = hotpic_orig.size
-        rot_w_orig, rot_h_orig = treepic_rotate_orig.size
-        cbar_w_orig, cbar_h_orig = colorbarpic_orig.size
-
-        # --- Resizing Strategy: Heatmap drives alignment ---
-        target_h = hot_h_orig
-        target_w = hot_w_orig
-
-        # Resize Left Tree - match heatmap height
-        aspect_ratio_tree = tree_w_orig / tree_h_orig
-        new_tree_w = int(target_h * aspect_ratio_tree)
-        treepic = treepic_orig.resize((new_tree_w, target_h), Image.LANCZOS) # Use older LANCZOS
+        
+        target_h, target_w = hot_h_orig, hot_w_orig
+        
+        new_tree_w = int(target_h * (tree_w_orig / tree_h_orig))
+        treepic = treepic_orig.resize((new_tree_w, target_h), Image.LANCZOS)
         tree_w, tree_h = treepic.size
-        print(f"Resized left tree to {tree_w}x{tree_h}")
-
-        # Resize Rotated Tree - match heatmap width
-        aspect_ratio_rot = rot_h_orig / rot_w_orig
-        new_rot_h = int(target_w * aspect_ratio_rot)
-        treepic_rotate = treepic_rotate_orig.resize((target_w, new_rot_h), Image.LANCZOS) # Use older LANCZOS
-        rot_w, rot_h = treepic_rotate.size
-        print(f"Resized rotated tree to {rot_w}x{rot_h}")
-
-        # Resize Colorbar - match heatmap height
-        aspect_ratio_cbar = cbar_w_orig / cbar_h_orig
-        new_cbar_w = int(target_h * aspect_ratio_cbar)
-        colorbarpic = colorbarpic_orig.resize((new_cbar_w, target_h), Image.LANCZOS) # Use older LANCZOS
+        
+        new_rot_h = int(target_w * (treepic_rotate_orig.height / treepic_rotate_orig.width))
+        treepic_rotate = treepic_rotate_orig.resize((target_w, new_rot_h), Image.LANCZOS)
+        
+        new_cbar_w = int(target_h * (colorbarpic_orig.width / colorbarpic_orig.height))
+        colorbarpic = colorbarpic_orig.resize((new_cbar_w, target_h), Image.LANCZOS)
         cbar_w, cbar_h = colorbarpic.size
-        print(f"Resized colorbar to {cbar_w}x{cbar_h}")
-
-        # Keep original heatmap
-        hotpic = hotpic_orig
-        hot_w, hot_h = hotpic.size
-
-        # --- Define padding ---
-        padding = 20 # General padding
-        padding_between = 10 # Between heatmap and rotated tree
-
-        # --- Calculate total canvas size ---
-        total_width = tree_w + hot_w + cbar_w + 4 * padding
-        middle_col_h = hot_h + padding_between + rot_h
-        total_height = max(tree_h, middle_col_h) + 2 * padding
-
-        # Create canvas
+        
+        padding, padding_between = 20, 10
+        total_width = tree_w + target_w + cbar_w + 4 * padding
+        total_height = max(tree_h, target_h + padding_between + new_rot_h) + 2 * padding
+        
         combine = Image.new("RGB", (total_width, total_height), "#FFFFFF")
-        print(f"Creating canvas: {total_width}x{total_height}")
-
-        # --- Calculate Paste Coordinates ---
-        paste_x_hot = padding + tree_w + padding
-        paste_y_hot = padding
-        print(f"Pasting heatmap at ({paste_x_hot}, {paste_y_hot}) size {hotpic.size}")
-        combine.paste(hotpic, (paste_x_hot, paste_y_hot))
-
-        paste_x_tree = padding
-        paste_y_tree = padding
-        print(f"Pasting tree at ({paste_x_tree}, {paste_y_tree}) size {treepic.size}")
-        combine.paste(treepic, (paste_x_tree, paste_y_tree))
-
-        paste_x_rot = paste_x_hot
-        paste_y_rot = paste_y_hot + hot_h + padding_between
-        print(f"Pasting rotated tree at ({paste_x_rot}, {paste_y_rot}) size {treepic_rotate.size}")
-        combine.paste(treepic_rotate, (paste_x_rot, paste_y_rot))
-
-        paste_x_cbar = paste_x_hot + hot_w + padding
-        paste_y_cbar = padding
-        print(f"Pasting colorbar at ({paste_x_cbar}, {paste_y_cbar}) size {colorbarpic.size}")
-        combine.paste(colorbarpic, (paste_x_cbar, paste_y_cbar))
-
-        # Save image
-        output_filename = fig_name + ".png"
+        
+        combine.paste(treepic, (padding, padding))
+        combine.paste(hotpic_orig, (padding + tree_w + padding, padding))
+        combine.paste(treepic_rotate, (padding + tree_w + padding, padding + target_h + padding_between))
+        combine.paste(colorbarpic, (padding + tree_w + padding + target_w + padding, padding))
+        
+        output_filename = fig_prefix + "_combined.png"
         combine.save(output_filename)
         print(f"Final image saved: {output_filename}")
-
+        return True
     except Exception as e:
         print(f"Error during image combination or saving: {e}")
         import traceback
         traceback.print_exc()
+        return False
     finally:
-        # Clean up temporary files
-        try: treepic_orig.close()
-        except: pass
-        try: hotpic_orig.close()
-        except: pass
-        try: colorbarpic_orig.close()
-        except: pass
-        try: treepic_rotate_orig.close()
-        except: pass
-        try: treepic.close()
-        except: pass
-        try: hotpic.close() # hotpic is just hotpic_orig now
-        except: pass
-        try: colorbarpic.close()
-        except: pass
-        try: treepic_rotate.close()
-        except: pass
-
-        for f_path in [hotmap_img_path, tree_img_path, colorbar_img_path]:
+        for img in ['treepic_orig', 'hotpic_orig', 'colorbarpic_orig', 'treepic_rotate_orig', 'treepic', 'colorbarpic', 'treepic_rotate']:
+            try: locals()[img].close()
+            except (KeyError, NameError): pass
+        for f_path in [temp_hotmap_file, temp_tree_file, temp_colorbar_file]:
             try:
                 if f_path and os.path.exists(f_path): os.remove(f_path)
             except OSError as e: print(f"Warning: Could not delete temp file {f_path}: {e}")
-
-# --- Name Consistency Check Function ---
-def check_name_consistency(tree, hyde_df):
-    """Checks name consistency between tree leaves and HyDe participants."""
-    leaves_name_in_species_tree = set()
-    try:
-        # Simplified ingroup logic for checking (adjust if needed)
-        if len(tree.children) == 2 and len(tree.children[0]) != len(tree.children[1]):
-             ingroup_node = max(tree.children, key=len)
-        else: ingroup_node = tree # Check all if ambiguous/not bifurcating
-        leaves_name_in_species_tree = set(str(leaf.name) for leaf in ingroup_node.get_leaves() if leaf.name is not None)
-    except Exception as e:
-        print(f"Error extracting leaf names from tree: {e}"); return False
-    if not leaves_name_in_species_tree:
-        print("Error: Could not extract any valid leaf node names from tree."); return False
-
-    hyde_names = set()
-    try:
-        for col in ['P1', 'Hybrid', 'P2']:
-            if col in hyde_df.columns:
-                valid_names = {str(name) for name in hyde_df[col].dropna().unique() if name}
-                hyde_names.update(valid_names)
-    except Exception as e: print(f"Error extracting names from HyDe data: {e}"); return False
-    if not hyde_names: print("Error: No valid names (P1/Hybrid/P2) from HyDe file."); return False
-
-    if leaves_name_in_species_tree.issuperset(hyde_names): # Allow tree to have extra leaves (outgroup)
-        print("Name consistency check passed: All HyDe participants found in tree leaves.")
-        missing_in_hyde = leaves_name_in_species_tree - hyde_names
-        if missing_in_hyde: print(f"  (Tree leaves not in HyDe: {missing_in_hyde})")
-        return True
-    else:
-        print("Warning: Name mismatch!")
-        missing_in_tree = hyde_names - leaves_name_in_species_tree
-        if missing_in_tree: print(f"  Names in HyDe but not in tree: {missing_in_tree}")
-        if not leaves_name_in_species_tree.intersection(hyde_names):
-             print("Error: No common names found. Cannot proceed."); return False
-        print("Proceeding with common names, but be aware of mismatches.")
-        return True # Allow proceeding with partial match
-
-
-
-
-
 
 # --- Main Program ---
 def main():
     parser = argparse.ArgumentParser(
         description="Options for visual_hyde.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        # epilog=Description # Make sure 'Description' variable is defined if used
+        epilog=Description
     )
     required = parser.add_argument_group("Required arguments")
     required.add_argument('-i', '--infile', action="store", metavar='FILE', type=str, required=True, help="HyDe output file")
     required.add_argument('-t', '--treefile', action="store", metavar='FILE', type=str, required=True, help="Species tree file (Newick)")
+    
+    node_args = parser.add_argument_group("Arguments for Node Mode")
+    node_args.add_argument('-n', '--node', action="store_true", default=False, help='Activate Node model (uses difference consensus algorithm)')
+    node_args.add_argument('-gdt', '--gamma_diff_threshold', action="store", type=float, default=0.2, metavar='F', help='LOOSE Gamma diff threshold for Stage 1 draft calculation (def: 0.2)')
+    node_args.add_argument('--diff_consensus_threshold', action="store", type=float, default=0.1, metavar='F', help="Threshold for a gamma difference to be considered 'low' (def: 0.1)")
+    node_args.add_argument('--diff_consensus_ratio', action="store", type=float, default=0.8, metavar='F', help="Minimum ratio of nodes with 'low' difference to form consensus (def: 0.8)")
 
-    additional = parser.add_argument_group("Additional arguments")
-    additional.add_argument('-n', '--node', action="store_true", default=False, help='Node model')
-    additional.add_argument('-gdt', '--gamma_diff_threshold', action="store", type=float, default=0.2, metavar='F', help='Gamma diff threshold for node avg (def: 0.2)')
-    additional.add_argument('-c', '--preclade', action="store", metavar='FILE', type=str, help='Predefined clades file')
-    additional.add_argument('-l', '--leaves', action="store", metavar='LEAF', type=str, help='(Leaf mode only) Process single leaf')
-    additional.add_argument('-z', '--zscore', action="store", type=float, default=3.0, metavar='F', help='Z-score threshold (def: 3.0)')
-    # additional.add_argument('-cb', '--cbright', action="store", type=float, default=0.6, metavar='F', help='Colorbar brightness factor (def: 0.6)') # Example if brightness becomes an argument
+    filter_args = parser.add_argument_group("Optional False Positive Filtering")
+    filter_args.add_argument('--filter_dir', action="store", metavar='DIR', type=str, help='Directory with null-hypothesis CSVs for filtering')
+    filter_args.add_argument('--filter_ratio_threshold', action="store", type=float, default=0.05, metavar='F', help='Ratio threshold for null-hypothesis filter (def: 0.05)')
 
+    other = parser.add_argument_group("Other arguments")
+    other.add_argument('-c', '--preclade', action="store", metavar='FILE', type=str, help='Predefined clades file')
+    other.add_argument('-l', '--leaves', action="store", metavar='LEAF', type=str, help='(Leaf mode only) Process single leaf')
+    other.add_argument('-p', '--pvalue', action="store", type=float, default=0.05, metavar='F', help='P-value threshold for significant results (def: 0.05)')
     args = parser.parse_args()
 
-    csv_file_name = args.infile
-    tree_file = args.treefile
-    node_model = args.node
-    gamma_diff_threshold = args.gamma_diff_threshold
-    predefined_clade_file_arg = args.preclade
-    single_leaf_to_process = args.leaves
-    zscore_threshold = args.zscore
-    # colorbar_brightness_factor = args.cbright # Use if it becomes an arg
-    colorbar_brightness_factor = 0.6 # Define the brightness factor
-
-    # --- File Checks ---
-    if not os.path.exists(tree_file):
-        print(f"Error: Tree file not found: {tree_file}"); sys.exit(1)
-    if not os.path.exists(csv_file_name):
-        print(f"Error: HyDe output file not found: {csv_file_name}"); sys.exit(1)
-
-    # --- Parse Tree (initial for checks) ---
+    # --- File checks and data loading ---
+    if not os.path.exists(args.treefile): print(f"FATAL ERROR: Tree file not found: {args.treefile}"); sys.exit(1)
+    if not os.path.exists(args.infile): print(f"FATAL ERROR: HyDe output file not found: {args.infile}"); sys.exit(1)
+    
     try:
-        input_tree = Tree(tree_file)
-        if not input_tree.get_leaves():
-            print("Error: Input tree file contains no leaves."); sys.exit(1)
+        input_tree = Tree(args.treefile)
+        if not input_tree.get_leaves(): print("FATAL ERROR: Input tree file contains no leaves."); sys.exit(1)
     except Exception as e:
-        print(f"Error: Error parsing tree file '{tree_file}': {e}"); sys.exit(1)
-
-    # --- Read HyDe Data ---
-    print(f"Reading HyDe output file: {csv_file_name} ...")
+        print(f"FATAL ERROR: Error parsing tree file '{args.treefile}': {e}"); sys.exit(1)
+    
+    print(f"Reading HyDe output file: {args.infile} ...")
     try:
-        hyde_data_df = pd.read_csv(csv_file_name, sep="\t")
-        required_cols = ["P1", "Hybrid", "P2", "Zscore", "Gamma"]
+        hyde_data_df = pd.read_csv(args.infile, sep="\t")
+        required_cols = ["P1", "Hybrid", "P2", "Pvalue", "Gamma"]
         if not all(col in hyde_data_df.columns for col in required_cols):
             missing = [col for col in required_cols if col not in hyde_data_df.columns]
-            print(f"Error: HyDe file missing columns: {missing}"); sys.exit(1)
-
-        # Convert necessary columns and handle NaNs/empty strings
+            print(f"FATAL ERROR: HyDe file missing columns: {missing}"); sys.exit(1)
         hyde_data_df['Gamma'] = pd.to_numeric(hyde_data_df['Gamma'], errors='coerce')
-        hyde_data_df['Zscore'] = pd.to_numeric(hyde_data_df['Zscore'], errors='coerce')
+        hyde_data_df['Pvalue'] = pd.to_numeric(hyde_data_df['Pvalue'], errors='coerce')
         initial_rows = len(hyde_data_df)
-        hyde_data_df.dropna(subset=['Gamma', 'Zscore', 'P1', 'Hybrid', 'P2'], inplace=True)
+        hyde_data_df.dropna(subset=['Gamma', 'Pvalue', 'P1', 'Hybrid', 'P2'], inplace=True)
         for col in ['P1', 'Hybrid', 'P2']:
-            # Ensure names are treated as strings and remove rows with empty strings
             hyde_data_df = hyde_data_df[hyde_data_df[col].astype(str).str.strip() != '']
         if len(hyde_data_df) < initial_rows:
             print(f"Warning: Dropped {initial_rows - len(hyde_data_df)} rows from HyDe data due to invalid/missing values.")
         if hyde_data_df.empty:
-            print("Error: No valid data rows remaining in HyDe file after cleaning."); sys.exit(1)
+            print("FATAL ERROR: No valid data rows remaining in HyDe file after cleaning."); sys.exit(1)
         print("File reading and basic validation completed.")
     except Exception as e:
-        print(f"Error reading or processing HyDe file '{csv_file_name}': {e}"); sys.exit(1)
-
-    # --- Check Names ---
+        print(f"FATAL ERROR: Error reading or processing HyDe file '{args.infile}': {e}"); sys.exit(1)
+    
     if not check_name_consistency(input_tree, hyde_data_df):
-        print("Exiting due to name inconsistency."); sys.exit(1)
-
-    # --- Handle Clade File ---
+        sys.exit(1)
+    
     actual_predefined_clade_file = None
-    if predefined_clade_file_arg:
-        if os.path.exists(predefined_clade_file_arg):
-            actual_predefined_clade_file = predefined_clade_file_arg
+    if args.preclade:
+        if os.path.exists(args.preclade):
+            actual_predefined_clade_file = args.preclade
         else:
-            print(f"Warning: Clade file '{predefined_clade_file_arg}' not found, generating automatically.")
-            actual_predefined_clade_file = make_predefined_clade_file(tree_file)
+            print(f"Warning: Clade file '{args.preclade}' not found, generating automatically.")
+            actual_predefined_clade_file = make_predefined_clade_file(args.treefile)
     else:
         print("Clade file not specified, generating automatically.")
-        actual_predefined_clade_file = make_predefined_clade_file(tree_file)
-
+        actual_predefined_clade_file = make_predefined_clade_file(args.treefile)
+    
     if not actual_predefined_clade_file or not os.path.exists(actual_predefined_clade_file):
-        print("Error: Could not find or generate clade file."); sys.exit(1)
+        print("FATAL ERROR: Could not find or generate clade file."); sys.exit(1)
+    
     print(f"Using clade file: {actual_predefined_clade_file}")
-
-
-    # --- Parse Tree and Clades (main) ---
-    parse_result = parse_tree(tree_file, actual_predefined_clade_file)
+    parse_result = parse_tree(args.treefile, actual_predefined_clade_file)
     if parse_result is None:
-        print("Error: Failed to parse tree or clade file."); sys.exit(1)
+        print("FATAL ERROR: Failed to parse tree or clade file."); sys.exit(1)
+    
     _, leaf_labels_ingroup, clade_defs, name_len_range = parse_result
-    parsed_tree = input_tree # Use the tree loaded earlier
+    parsed_tree = input_tree
     leaf_labels_ingroup_str = [str(lbl) for lbl in leaf_labels_ingroup]
     if not leaf_labels_ingroup_str :
-        print("Error: No ingroup labels found after parsing."); sys.exit(1)
+        print("FATAL ERROR: No ingroup labels found after parsing."); sys.exit(1)
 
-    # --- Ensure colorsys is available ---
-    try:
-        colorsys
-    except NameError:
-        print("Error: colorsys module not imported!"); sys.exit(1)
+    # --- Load and VALIDATE Null Hypothesis Data (if provided) ---
+    null_heatmap_data = {}
+    if args.filter_dir:
+        if not os.path.isdir(args.filter_dir):
+            print(f"FATAL ERROR: Filter directory not found: {args.filter_dir}")
+            sys.exit(1)
+        print(f"Loading and validating null hypothesis filter data from: {args.filter_dir}...")
+        
+        for filename in os.listdir(args.filter_dir):
+            if filename.endswith(".csv"):
+                safe_name = os.path.splitext(filename)[0]
+                try:
+                    null_df = pd.read_csv(os.path.join(args.filter_dir, filename), index_col=0)
+                    if set(null_df.index) != set(leaf_labels_ingroup_str):
+                        print(f"\nFATAL ERROR: Name mismatch inside filter file '{filename}'.")
+                        print("The row/column names in this file do not exactly match the leaf names in the main species tree.")
+                        sys.exit(1)
+                    null_heatmap_data[safe_name] = null_df
+                except Exception as e:
+                    print(f"Warning: Could not load or parse null data file {filename}: {e}")
+        print(f"Loaded and validated {len(null_heatmap_data)} filter files.")
 
     # --- Main Processing ---
-    if node_model:
-        # --- Node Mode Loop ---
-        node_heatmaps_cache = calculate_all_node_heatmaps(parsed_tree, leaf_labels_ingroup_str, hyde_data_df, zscore_threshold, gamma_diff_threshold)
-        print(f"Running Node Mode ...")
+    if args.node:
+        node_heatmaps_cache, node_calculation_logs = calculate_all_node_heatmaps(
+            parsed_tree, leaf_labels_ingroup_str, hyde_data_df, args.pvalue, 
+            gamma_diff_threshold=args.gamma_diff_threshold, 
+            diff_consensus_threshold=args.diff_consensus_threshold,
+            diff_consensus_ratio=args.diff_consensus_ratio
+        )
+        print(f"\nRunning Node Mode using 'difference consensus' algorithm...")
 
         all_nodes_postorder = list(parsed_tree.traverse("postorder"))
-        # Identify structurally suitable nodes first, EXCLUDING the root
         plottable_node_indices = []
         for i, n in enumerate(all_nodes_postorder):
-            # *** MODIFIED CONDITION TO EXCLUDE ROOT ***
-            # Check if it's not a leaf AND explicitly not the root node
             if not n.is_leaf() and not n.is_root():
                 node_leaves_in_ingroup = [leaf for leaf in n.get_leaves() if str(leaf.name) in leaf_labels_ingroup_str]
-                # Criteria: Internal node (not root), >=2 ingroup descendants, binary structure assumed by calculation logic
                 if len(node_leaves_in_ingroup) >= 2 and len(n.children) == 2:
                     plottable_node_indices.append(i)
 
         total_plottable_nodes = len(plottable_node_indices)
-        # Updated print statement for clarity
         print(f"Found {total_plottable_nodes} potentially plottable internal nodes (explicitly excluding the root node).")
 
         processed_nodes = 0
-        current_plot_index = 0 # Tracks the index among plottable nodes
+        current_plot_index = 0
         for node_idx, each_node in enumerate(all_nodes_postorder):
-            # Skip nodes not in our pre-filtered list (which now excludes the root)
-            if node_idx not in plottable_node_indices:
-                continue
+            if node_idx not in plottable_node_indices: continue
 
-            # --- No extra root check needed here anymore ---
-
-            current_plot_index += 1 # Increment only for non-root, plottable nodes
+            current_plot_index += 1
             node_name_str = str(each_node.name) if hasattr(each_node, 'name') and each_node.name else f"Internal_{current_plot_index}"
             fig_prefix = f"Node_{current_plot_index}"
-            # Slightly adjusted print statement to reflect the filtered count
-            print(f"Processing Node {current_plot_index}/{total_plottable_nodes} ({node_name_str})...")
+            print(f"\nProcessing Node {current_plot_index}/{total_plottable_nodes} ({node_name_str})...")
 
-            # Retrieve calculated heatmap data for this node
+            calculation_log = node_calculation_logs.get(each_node)
+            if calculation_log:
+                # *** MODIFIED: Change extension to .tsv and use tab delimiter ***
+                log_filename = f"{fig_prefix}_calculation_details.tsv"
+                print(f"  Writing calculation details to {log_filename}...")
+                try:
+                    with open(log_filename, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f, delimiter='\t')
+                        header = [
+                            "Node_ID", "Parent_1", "Parent_2", "Consensus_Threshold_Ratio", "Low_Diff_Ratio_Found",
+                            "Low_Diff_Points", "Total_Internal_Nodes_in_Subtree", "Low_Diff_Threshold",
+                            "Final_Gamma_Value", "Result", "Subtree_Gamma_Diffs"
+                        ]
+                        writer.writerow(header)
+                        for row in calculation_log:
+                            writer.writerow([f"Node_{current_plot_index}"] + row)
+                except Exception as e:
+                    print(f"  Warning: Could not write calculation TSV log file: {e}")
+
             hyde_node_array = node_heatmaps_cache.get(each_node)
-
-            # --- MODIFIED CHECK FOR NODE MODE ---
-            # Skip ONLY if data calculation failed (is None), otherwise proceed
             if hyde_node_array is None:
                 print(f"  Skipping plot: Heatmap data calculation failed or node not found in cache.")
                 continue
+            
+            if args.filter_dir:
+                null_node_heatmap = null_heatmap_data.get(fig_prefix)
+                if null_node_heatmap is not None:
+                    print(f"  Applying null hypothesis filter for node: {fig_prefix}...")
+                    hyde_node_array = apply_relative_filter(hyde_node_array, null_node_heatmap, args.filter_ratio_threshold)
+                else:
+                    print(f"  Warning: No null hypothesis filter file found for {fig_prefix}.csv. Proceeding without filtering this node.")
 
-            # Check if data is empty, print message but DO NOT SKIP
-            is_empty_heatmap = hyde_node_array.isnull().all().all()
-            if is_empty_heatmap:
+
+            if hyde_node_array.isnull().all().all():
                 print(f"  Note: No significant data found for this node. Plotting with empty heatmap.")
-                # No 'continue' here - proceed to plot
-            # --- END MODIFIED CHECK ---
-
-
-            # --- Plotting Steps (executed even if heatmap is empty) ---
-
-            # 1. Draw heatmap (using dynamic sizing version, handles empty array)
-            temp_hotmap, cmap_for_heatmap, norm = draw_hotmap(fig_prefix, hyde_node_array)
-            if not temp_hotmap:
-                print(f"  Warning: Heatmap drawing failed for {node_name_str}. Skipping combine.")
-                continue # Skip if drawing itself failed
-
-            # 2. Create Darker Colormap
-            print(f"  Creating darker colorbar (brightness factor: {colorbar_brightness_factor})...")
-            darker_colors_rgba = []
-            cmap_for_colorbar = None # Initialize
-            if cmap_for_heatmap: # Check if base cmap was created
-                heatmap_colors_rgba = cmap_for_heatmap.colors
-                for r, g, b, a in heatmap_colors_rgba:
-                    try:
-                        h, s, v = colorsys.rgb_to_hsv(r, g, b)
-                        v_new = max(0.0, min(1.0, v * colorbar_brightness_factor))
-                        new_r, new_g, new_b = colorsys.hsv_to_rgb(h, s, v_new)
-                        darker_colors_rgba.append([new_r, new_g, new_b, a])
-                    except Exception as e:
-                        print(f"  Warning: Color darkening failed for one color ({r},{g},{b}): {e}. Using original.")
-                        darker_colors_rgba.append([r, g, b, a])
-                cmap_for_colorbar = ListedColormap(darker_colors_rgba)
-                cmap_for_colorbar.set_bad(color='white', alpha=0)
-            else:
-                print("  Warning: Cannot create darker colormap because base cmap failed. Skipping colorbar.")
-
-            # 3. Draw colorbar (only if cmap is valid)
-            temp_colorbar = None
-            if cmap_for_colorbar and norm:
-                temp_colorbar = draw_colorbar_only(f"{fig_prefix}_colorbar_temp.png", cmap_for_colorbar, norm)
-
-            if not temp_colorbar:
-                print(f"  Warning: Colorbar drawing failed or skipped for {node_name_str}. Skipping combine.")
-                # Clean up heatmap if it exists, then skip combining
-                if temp_hotmap and os.path.exists(temp_hotmap): os.remove(temp_hotmap)
-                continue
-
-            # 4. Draw tree
-            # Get leaves belonging to this node to highlight the clade
+            
             node_ingroup_leaves = [str(leaf.name) for leaf in each_node.get_leaves() if str(leaf.name) in leaf_labels_ingroup_str]
-            temp_tree = draw_tree(tree_file, current_plot_index, node_ingroup_leaves, clade_defs, name_len_range, 0)
-            if not temp_tree:
-                print(f"  Warning: Tree drawing failed for {node_name_str}. Skipping combine.")
-                if temp_hotmap and os.path.exists(temp_hotmap): os.remove(temp_hotmap)
-                if temp_colorbar and os.path.exists(temp_colorbar): os.remove(temp_colorbar)
-                continue
+            
+            success = generate_hyde_visualization(
+                fig_prefix, hyde_node_array, args.treefile, current_plot_index, 
+                node_ingroup_leaves, clade_defs, name_len_range, 0.6
+            )
 
-            # 5. Combine
-            print(f"  Combining images for {fig_prefix}...")
-            combine_fig(fig_prefix + "_combined", temp_tree, temp_hotmap, temp_colorbar)
-            processed_nodes += 1 # Count successful combinations
+            if success:
+                processed_nodes += 1
+            else:
+                print(f"  Warning: Image generation failed for node {node_name_str}. Skipping.")
 
-        print(f"Node mode processing completed. Generated images for {processed_nodes} internal nodes (root excluded).")
+        print(f"\nNode mode processing completed. Generated images for {processed_nodes} internal nodes.")
 
-    else: # Leaf Mode (remains unchanged from previous version - plots all specified leaves)
-        # --- Leaf Mode Loop ---
+    else: # Leaf Mode
         leaves_to_process = []
         hyde_hybrid_names = {str(name) for name in hyde_data_df['Hybrid'].unique()}
-
-        if single_leaf_to_process:
-            single_leaf_str = str(single_leaf_to_process)
+        if args.leaves:
+            single_leaf_str = str(args.leaves)
             if single_leaf_str in leaf_labels_ingroup_str:
                 if single_leaf_str in hyde_hybrid_names:
                     leaves_to_process = [single_leaf_str]
                 else:
-                    print(f"Warning: Specified leaf '{single_leaf_str}' exists in tree ingroup but is not found as a 'Hybrid' in the HyDe file '{csv_file_name}'. No plot generated.")
+                    print(f"Warning: Specified leaf '{single_leaf_str}' ... is not found as a 'Hybrid' ... No plot generated.")
                     sys.exit(0)
             else:
-                print(f"Error: Specified leaf '{single_leaf_str}' not found in the determined ingroup leaves of the tree '{tree_file}'."); sys.exit(1)
+                print(f"FATAL ERROR: Specified leaf '{single_leaf_str}' not found in the ingroup leaves..."); sys.exit(1)
         else:
             leaves_to_process = [leaf for leaf in leaf_labels_ingroup_str if leaf in hyde_hybrid_names]
             skipped_leaves = set(leaf_labels_ingroup_str) - set(leaves_to_process)
             if not leaves_to_process:
-                print(f"Error: None of the {len(leaf_labels_ingroup_str)} ingroup leaves were found as 'Hybrid' in the HyDe file '{csv_file_name}'. Cannot generate plots in Leaf Mode."); sys.exit(1)
-            print(f"Running Leaf Mode for {len(leaves_to_process)} leaves (found as 'Hybrid' in HyDe data)...")
+                print(f"FATAL ERROR: None of the ingroup leaves were found as 'Hybrid' in the HyDe file..."); sys.exit(1)
+            print(f"Running Leaf Mode for {len(leaves_to_process)} leaves...")
             if skipped_leaves:
-                print(f"  (Skipping {len(skipped_leaves)} ingroup leaves not listed as 'Hybrid' in HyDe file)")
+                print(f"  (Skipping {len(skipped_leaves)} ingroup leaves not listed as 'Hybrid')")
 
-
-        total_leaves_to_process = len(leaves_to_process)
         processed_leaves_count = 0
         for i, current_leaf in enumerate(leaves_to_process):
-            fig_num_prefix = f"{i+1}_" if not single_leaf_to_process else ""
-            safe_leaf_name = "".join(c if c.isalnum() else "_" for c in current_leaf)
-            fig_prefix = f"{fig_num_prefix}{safe_leaf_name}"
-            print(f"Plotting leaf node: {current_leaf} ({i+1}/{total_leaves_to_process})...")
-
-            # 0. Calculate heatmap data
-            hyde_leaf_array = make_hotmap_table_gamma(leaf_labels_ingroup_str, current_leaf, hyde_data_df, zscore_threshold)
-
+            safe_leaf_name = get_safe_leaf_name(current_leaf)
+            fig_prefix = f"{safe_leaf_name}"
+            print(f"Plotting leaf node: {current_leaf} ({i+1}/{len(leaves_to_process)})...")
+            
+            hyde_leaf_array = make_hotmap_table_gamma(leaf_labels_ingroup_str, current_leaf, hyde_data_df, args.pvalue,
+                                                      null_heatmap_data, args.filter_ratio_threshold)
             if hyde_leaf_array is None:
-                print(f"  Warning: Heatmap data calculation failed unexpectedly for {current_leaf}. Skipping plot.")
+                print(f"  Warning: Heatmap data calculation failed for {current_leaf}. Skipping.")
                 continue
-
-            # Check if data is empty, print message but DO NOT SKIP
             if hyde_leaf_array.isnull().all().all():
-                print(f"  Note: No significant data (Z > {zscore_threshold}) found for {current_leaf}. Plotting with empty heatmap.")
-                # No 'continue' here
+                print(f"  Note: No significant data (P < {args.pvalue}) found for {current_leaf}. Plotting with empty heatmap.")
+            
+            success = generate_hyde_visualization(
+                fig_prefix, hyde_leaf_array, args.treefile, "", 
+                current_leaf, clade_defs, name_len_range, 0.6
+            )
 
-            # 1. Draw heatmap
-            temp_hotmap, cmap_for_heatmap, norm = draw_hotmap(fig_prefix, hyde_leaf_array)
-            if not temp_hotmap:
-                print(f"  Warning: Heatmap drawing failed for {current_leaf}. Skipping combine.")
-                continue
-
-            # 2. Create Darker Colormap
-            print(f"  Creating darker colorbar (brightness factor: {colorbar_brightness_factor})...")
-            darker_colors_rgba = []
-            cmap_for_colorbar = None
-            if cmap_for_heatmap:
-                heatmap_colors_rgba = cmap_for_heatmap.colors
-                for r, g, b, a in heatmap_colors_rgba:
-                    try:
-                        h, s, v = colorsys.rgb_to_hsv(r, g, b)
-                        v_new = max(0.0, min(1.0, v * colorbar_brightness_factor))
-                        new_r, new_g, new_b = colorsys.hsv_to_rgb(h, s, v_new)
-                        darker_colors_rgba.append([new_r, new_g, new_b, a])
-                    except Exception as e:
-                        print(f"  Warning: Color darkening failed for one color ({r},{g},{b}): {e}. Using original.")
-                        darker_colors_rgba.append([r, g, b, a])
-                cmap_for_colorbar = ListedColormap(darker_colors_rgba)
-                cmap_for_colorbar.set_bad(color='white', alpha=0)
+            if success:
+                processed_leaves_count += 1
             else:
-                print("  Warning: Cannot create darker colormap because base cmap failed. Skipping colorbar.")
-
-            # 3. Draw colorbar
-            temp_colorbar = None
-            if cmap_for_colorbar and norm:
-                temp_colorbar = draw_colorbar_only(f"{fig_prefix}_colorbar_temp.png", cmap_for_colorbar, norm)
-
-            if not temp_colorbar:
-                print(f"  Warning: Colorbar drawing failed or skipped for {current_leaf}. Skipping combine.")
-                if temp_hotmap and os.path.exists(temp_hotmap): os.remove(temp_hotmap)
-                continue
-
-            # 4. Draw tree
-            temp_tree = draw_tree(tree_file, "", current_leaf, clade_defs, name_len_range, 0)
-            if not temp_tree:
-                print(f"  Warning: Tree drawing failed for {current_leaf}. Skipping combine.")
-                if temp_hotmap and os.path.exists(temp_hotmap): os.remove(temp_hotmap)
-                if temp_colorbar and os.path.exists(temp_colorbar): os.remove(temp_colorbar)
-                continue
-
-            # 5. Combine
-            print(f"  Combining images for {fig_prefix}...")
-            combine_fig(fig_prefix + "_combined", temp_tree, temp_hotmap, temp_colorbar)
-            processed_leaves_count += 1
+                print(f"  Warning: Image generation failed for leaf {current_leaf}. Skipping.")
 
         print(f"Leaf mode processing completed. Generated images for {processed_leaves_count} leaves.")
-
 
 if __name__ == "__main__":
     main()
