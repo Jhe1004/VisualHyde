@@ -237,6 +237,6 @@ For each leaf or node analyzed (e.g., `SpeciesA`), the script generates:
 
 ## Citation & Contact
 
-This script was created by Jian He (`j.he930724@gamail.com`) and modified for enhanced logging and advanced algorithms by the Assistant.
+This script was created by Jian He (`j.he930724@gamail.com`).
 
 If you use VisualHyDe in your research, please cite this GitHub repository and the original HyDe paper.
