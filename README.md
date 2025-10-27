@@ -239,4 +239,10 @@ For each leaf or node analyzed (e.g., `SpeciesA`), the script generates:
 
 This script was created by Jian He (`j.he930724@gamail.com`).
 
-If you use VisualHyDe in your research, please cite this GitHub repository and the original HyDe paper.
+If you use VisualHyDe in your research, please cite the following two papers:
+
+1.  **The VisualHyDe paper:**
+    He, J., Li, M., Xiao, J., Luo, Y., Li, W., Wu, H., Luo, Y., & Xie, L. (2025). Ancient hybridization and combinatorial mechanism: drivers of adaptive evolution in *Clematis* sect. *Fruticella* (Ranunculaceae). *New Phytologist*. DOI: 10.1111/nph.70658
+
+2.  **The original HyDe paper:**
+    Blischak, P. D., Chifman, J., Wolfe, A. D., & Kubatko, L. S. (2018). HyDe: a Python package for genome-scale hybridization detection. *Systematic Biology*, *67*(5), 821-829. DOI: 10.1093/sysbio/syy023
